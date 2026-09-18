@@ -33,14 +33,21 @@ _CJK_CANDIDATES = [
 
 
 def _setup_fonts() -> bool:
-    available = {f.name for f in font_manager.fontManager.ttflist}
+    """True when a CJK font was found.
+
+    Never raises: a font or font-cache problem on the host must not take the
+    whole app down - the labels just fall back to ASCII.
+    """
+    plt.rcParams["axes.unicode_minus"] = False
+    plt.rcParams["font.sans-serif"] = ["DejaVu Sans"]
+    try:
+        available = {f.name for f in font_manager.fontManager.ttflist}
+    except Exception:
+        return False
     for cand in _CJK_CANDIDATES:
         if cand in available:
             plt.rcParams["font.sans-serif"] = [cand, "DejaVu Sans"]
-            plt.rcParams["axes.unicode_minus"] = False
             return True
-    plt.rcParams["font.sans-serif"] = ["DejaVu Sans"]
-    plt.rcParams["axes.unicode_minus"] = False
     return False
 
 
