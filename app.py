@@ -5,8 +5,12 @@ Deploy (free):    Streamlit Community Cloud, main file = astk_web/app.py
 """
 from __future__ import annotations
 
+import hashlib
 import io
+import sys
+import traceback
 import zipfile
+from importlib import metadata
 from pathlib import Path
 from typing import Dict
 
@@ -24,6 +28,31 @@ AS_ORDER = core.AS_TYPES
 
 
 # ------------------------------------------------------------------ helpers --
+
+def _pkg_version(name: str) -> str:
+    """装了哪个版本就报哪个版本 —— 线上排查环境差异用。"""
+    try:
+        return name + " " + metadata.version(name)
+    except Exception:
+        return name + " 未安装"
+
+
+def _source_fingerprint(module) -> str:
+    """源码指纹：云端到底跑的是哪一版代码，看这个就够，不用去翻 logs。"""
+    try:
+        path = Path(getattr(module, "__file__", "") or "")
+        return path.name + " " + hashlib.sha1(path.read_bytes()).hexdigest()[:10]
+    except Exception:
+        return "未知"
+
+
+def _env_info() -> str:
+    parts = ["python " + ".".join(str(v) for v in sys.version_info[:3])]
+    parts += [_pkg_version(p) for p in
+              ("streamlit", "pandas", "numpy", "scipy", "matplotlib", "scikit-learn")]
+    parts.append("源码 " + _source_fingerprint(core) + " / " + _source_fingerprint(plots))
+    return " ｜ ".join(parts)
+
 
 def _sample_name_from_upload(name: str, idx: int) -> str:
     stem = Path(name).stem
@@ -306,8 +335,17 @@ if run:
     if psi:
         psi = {et: df for et, df in psi.items() if not df.empty and df.shape[0] > 0}
         comps = core.build_comparisons(groups, reference, all_pairs)
-        dpsi = core.dpsi_tables(psi, groups, comparisons=comps, method=method,
-                                ioe=ioe_tables, tpm=tpm_tables) if comps else {}
+        try:
+            dpsi = core.dpsi_tables(psi, groups, comparisons=comps, method=method,
+                                    ioe=ioe_tables, tpm=tpm_tables) if comps else {}
+        except Exception as exc:
+            # Streamlit 默认只说「去看 logs」，公网用户拿不到 —— 直接把完整堆栈摆到
+            # 页面上，出问题的人把这一段贴回来就能定位，也免得整页崩成红框。
+            st.error(f"差异分析失败：{type(exc).__name__}: {exc}")
+            with st.expander("完整错误信息（出错时把这一段复制给开发者）", expanded=True):
+                st.code(traceback.format_exc(), language="text")
+                st.markdown(f"**运行环境**　{_env_info()}")
+            st.stop()
         st.session_state["results"] = {"psi": psi, "dpsi": dpsi, "groups": dict(groups),
                                        "ioe": ioe_tables, "tpm": list(tpm_tables),
                                        "comparisons": comps, "reference": reference,
@@ -352,6 +390,7 @@ st.sidebar.divider()
 st.sidebar.markdown("**请引用 ASTK**")
 st.sidebar.caption(core.ASTK_CITATION)
 st.sidebar.markdown(f"[论文]({core.ASTK_DOI}) ｜ [源码]({core.ASTK_REPO}) ｜ [文档]({core.ASTK_DOCS})")
+st.sidebar.caption("运行环境：" + _env_info())
 
 res = st.session_state.get("results")
 if not res:
