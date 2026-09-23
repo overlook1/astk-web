@@ -603,7 +603,10 @@ def _event_replicate_logtpm(ioe_df: Optional[pd.DataFrame],
     samples = [s for s in list(ref_samples) + list(test_samples) if s in tpm_tables]
     if not samples:
         return {}
-    tpm_of = {s: pd.to_numeric(tpm_tables[s].iloc[:, 0], errors="coerce") for s in samples}
+    # 转录本 -> TPM 用普通 dict 查表。逐事件调 pandas ``reindex`` 在真实数据上要几十秒，
+    # 换成 dict 之后一个事件只是几次 O(1) 查找。
+    tpm_of = {s: pd.to_numeric(tpm_tables[s].iloc[:, 0], errors="coerce").to_dict()
+              for s in samples}
     tx_lists = ioe_df["total_transcripts"].astype(str).str.split(",").to_numpy()
 
     out: Dict[str, Dict[str, List[float]]] = {}
@@ -613,13 +616,18 @@ def _event_replicate_logtpm(ioe_df: Optional[pd.DataFrame],
         for label, group in (("ref", ref_samples), ("test", test_samples)):
             values: List[float] = []
             for s in group:
-                ser = tpm_of.get(s)
-                if ser is None:
+                table = tpm_of.get(s)
+                if table is None:
                     continue
-                sub = ser.reindex(tx_lists[i]).dropna()
-                if sub.empty:
+                total, seen = 0.0, 0
+                for tx in tx_lists[i]:
+                    v = table.get(tx)
+                    if v is None or v != v:      # 转录本缺失 / TPM 为 NaN：按 SUPPA2 跳过
+                        continue
+                    total += v
+                    seen += 1
+                if not seen:
                     continue
-                total = float(sub.sum())
                 if not np.isfinite(total) or total <= 0:
                     continue
                 values.append(float(math.log10(total)))
@@ -659,7 +667,7 @@ def _slice_local(values: Sequence[float], index: int, area: int) -> List[float]:
 
 def _closest_index(sorted_values: Sequence[float], target: float) -> int:
     """SUPPA2 ``get_closest_number``：返回离 target 最近的位置（并列取较小值）。"""
-    pos = bisect_left(list(sorted_values), target)
+    pos = bisect_left(sorted_values, target)
     if pos == 0:
         return 0
     if pos == len(sorted_values):
@@ -670,7 +678,8 @@ def _closest_index(sorted_values: Sequence[float], target: float) -> int:
 
 def _ecdf(values: Sequence[float], x: float) -> float:
     """经验分布函数（和 statsmodels 的 ECDF 一样取「≤ x 的比例」）。"""
-    arr = np.asarray([v for v in values if np.isfinite(v)], dtype=float)
+    arr = np.asarray(values, dtype=float)
+    arr = arr[np.isfinite(arr)]
     if arr.size == 0:
         return 0.0
     return float((arr <= x).sum()) / float(arr.size)
@@ -708,10 +717,12 @@ def empirical_dpsi_table(psi_df: pd.DataFrame, ref_samples: Sequence[str],
 
     # SUPPA2 的 nan 处理：某一侧缺失比例超过 nan_th 的事件整条丢弃，只留 (nan, 1.0)
     too_many_nan = (a.isna().mean(axis=1) > nan_th) | (b.isna().mean(axis=1) > nan_th)
+    too_many_nan_arr = too_many_nan.to_numpy(dtype=bool)
 
     rep_logtpm = dict(rep_logtpm or {})
     logtpm = event_logtpm(rep_logtpm)
     out["avg_logtpm"] = logtpm.reindex(out.index)
+    logtpm_of = logtpm.to_dict()
 
     enough = min(len(ref), len(tst)) >= min_reps
 
@@ -719,13 +730,13 @@ def empirical_dpsi_table(psi_df: pd.DataFrame, ref_samples: Sequence[str],
     # 事件取自己附近的一个窗口；完全没有表达量（只上传 PSI 文件）时退回全局背景。
     pairs_coord: List[Tuple[float, float]] = []   # (ΔPSI, 两个重复的平均 log10 TPM)
     deltas_all: List[float] = []                  # 所有条件内重复对的 ΔPSI
-    for event_id in out.index:
+    obs_by_cond = (("ref", a.to_numpy(dtype=float)), ("test", b.to_numpy(dtype=float)))
+    for i, event_id in enumerate(out.index):
         per_cond = rep_logtpm.get(str(event_id)) or {}
-        for label, group in (("ref", ref), ("test", tst)):
+        for label, obs in obs_by_cond:
             values = list(per_cond.get(label) or [])
-            obs = psi_df.loc[event_id, group].to_numpy(dtype=float)
             pairs_in_cond = []
-            for j, v in enumerate(obs):
+            for j, v in enumerate(obs[i]):
                 if not np.isfinite(v):
                     continue
                 coord = float(values[j]) if j < len(values) else np.nan
@@ -746,13 +757,14 @@ def empirical_dpsi_table(psi_df: pd.DataFrame, ref_samples: Sequence[str],
     if not deltas:
         deltas = deltas_all
 
-    pvals = pd.Series(np.nan, index=out.index, dtype=float)
+    dpsi_arr = out["dpsi"].to_numpy(dtype=float).copy()
+    pval_arr = np.full(len(out), np.nan, dtype=float)
     backgrounds: List[str] = []
     n_background: List[float] = []
-    for event_id in out.index:
-        if bool(too_many_nan.get(event_id, False)):
-            pvals[event_id] = 1.0          # 与 SUPPA2 一致：丢弃事件给 p = 1.0
-            out.loc[event_id, "dpsi"] = np.nan
+    for i, event_id in enumerate(out.index):
+        if too_many_nan_arr[i]:
+            pval_arr[i] = 1.0                 # 与 SUPPA2 一致：丢弃事件给 p = 1.0
+            dpsi_arr[i] = np.nan
             backgrounds.append("discarded")
             n_background.append(np.nan)
             continue
@@ -760,22 +772,24 @@ def empirical_dpsi_table(psi_df: pd.DataFrame, ref_samples: Sequence[str],
             backgrounds.append("none")
             n_background.append(np.nan)
             continue
-        coord = logtpm.get(str(event_id))
+        coord = logtpm_of.get(str(event_id), np.nan)
         if has_coord and np.isfinite(coord):
             local = _slice_local(deltas, _closest_index(grid, float(coord)), area)
             backgrounds.append("expression-window")
         else:
             local = deltas or deltas_all      # 没有表达量就退回全局背景
             backgrounds.append("global")
-        abs_dpsi = abs(float(out.loc[event_id, "dpsi"]))
+        abs_dpsi = abs(dpsi_arr[i])
         if -cutoff < abs_dpsi < cutoff:
-            pvals[event_id] = 1.0             # astk diffSplice -adpsi 的行为
+            pval_arr[i] = 1.0                 # astk diffSplice -adpsi 的行为
         else:
-            pvals[event_id] = (1.0 - _ecdf(local, abs_dpsi)) * 0.5
+            pval_arr[i] = (1.0 - _ecdf(local, abs_dpsi)) * 0.5
         n_background.append(len(local))
 
+    out["dpsi"] = dpsi_arr
     out["background"] = backgrounds
     out["n_background"] = n_background
+    pvals = pd.Series(pval_arr, index=out.index)
 
     if not enough:
         out["pval"] = np.nan                  # 组内重复不足：只给 dPSI
@@ -790,13 +804,18 @@ def empirical_dpsi_table(psi_df: pd.DataFrame, ref_samples: Sequence[str],
     qvals = pd.Series(np.nan, index=out.index, dtype=float)
     if len(tested):
         raw = pvals.loc[tested].to_numpy(dtype=float)
+        qcorr = np.empty_like(raw)
         if gene_correction and genes:
-            gene_of = pd.Series([genes.get(str(e), str(e)) for e in tested], index=tested)
-            for _, idx in gene_of.groupby(gene_of).groups.items():
-                idx = list(idx)
-                qvals.loc[idx] = _bh_fdr(pvals.loc[idx].to_numpy(dtype=float))
+            # 按基因内 BH：先把位置按基因分桶，再整桶算 —— 逐个 .loc 赋值在真实数据上要十几秒。
+            buckets: Dict[str, List[int]] = {}
+            for pos, event_id in enumerate(tested.tolist()):
+                buckets.setdefault(genes.get(str(event_id), str(event_id)), []).append(pos)
+            for positions in buckets.values():
+                idx = np.asarray(positions, dtype=int)
+                qcorr[idx] = _bh_fdr(raw[idx])
         else:
-            qvals.loc[tested] = _bh_fdr(raw)
+            qcorr = _bh_fdr(raw)
+        qvals.loc[tested] = qcorr
     out["qval"] = qvals
     return out
 

@@ -405,8 +405,10 @@ def fig_volcano(dpsi: pd.DataFrame, abs_dpsi: float = 0.1, qval: float = 0.05,
         notes.append(L(f"{n_capped:,} 个点超出纵轴上限 {max_neglog:g}",
                        f"{n_capped:,} points above the y-axis cap {max_neglog:g}"))
     if notes:
+        # 真实数据里 dPSI 接近 0 的位置点很密，注记会被点盖住，垫一层白底保证可读。
         ax.text(0.995, 0.02, "\n".join(notes), transform=ax.transAxes,
-                ha="right", va="bottom", fontsize=7, color=MUTED)
+                ha="right", va="bottom", fontsize=7, color=MUTED, zorder=6,
+                bbox=dict(facecolor="white", edgecolor="none", alpha=0.75, pad=1.5))
     _style(ax, "both")
     return _finish(fig)
 
