@@ -29,8 +29,19 @@ def _sample_name_from_upload(name: str, idx: int) -> str:
     stem = Path(name).stem
     if stem.lower() in ("quant", "abundance"):
         return f"sample_{idx + 1}"
-    return stem[:-6] if stem.endswith("_quant") else stem
+    for suffix in ("_quant", ".quant"):
+        if stem.endswith(suffix):
+            stem = stem[: -len(suffix)]
+            break
+    return stem
 
+
+def _guess_condition(sample: str) -> str:
+    """从样本名猜一个初始分组。猜错无所谓 —— 分组列可以随便改，组数不限。"""
+    low = sample.lower()
+    if any(k in low for k in ("case", "cko", "ko", "treat", "mut", "kd", "oe")):
+        return "cKO"
+    return "Control"
 
 def _figure_bytes(fig) -> bytes:
     buf = io.BytesIO()
@@ -88,6 +99,10 @@ ref_kind = st.sidebar.radio(
 
 with st.sidebar.expander("参数", expanded=True):
     tpm_threshold = st.number_input("TPM 阈值（低于则该事件记 NaN）", 0.0, 100.0, 1.0, 0.5)
+    method_label = st.radio(
+        "显著性方法", ["ASTK empirical（默认，与 astk dsflow 一致）", "Welch t 检验（旧口径）"],
+        help=core.EMPIRICAL_NOTE)
+    method = "empirical" if method_label.startswith("ASTK") else "welch"
     abs_dpsi = st.slider("|dPSI| 显著阈值", 0.0, 1.0, 0.10, 0.05)
     qval_cut = st.slider("q 值（BH FDR）阈值", 0.01, 0.5, 0.05, 0.01)
     top_n_events = st.slider("热图展示事件数", 10, 200, 40, 10)
@@ -201,16 +216,10 @@ if source_kind != "已有 PSI 结果" and tpm_tables:
 
 # ------------------------------------------------------------------ 分组设置 --
 
+# 分组名不写死、组数不限：演示数据自带 Control / cKO / Rescue，真实数据先按样本名
+# 猜一版填进表格，用户在「① 数据与分组」里随便改，参考组与比较对也跟着变。
 if source_kind == "已有 PSI 结果":
     groups = {}
-elif not groups:
-    groups = {}
-    samples = list(tpm_tables)
-    if samples:
-        default = {s: ("case" if any(k in s.lower() for k in ("case", "cko", "ko", "treat", "mut"))
-                       else "ctrl") for s in samples}
-        groups = default
-
 
 st.title("可变剪接事件分析")
 st.caption("输入转录表达定量 → 七类 AS 事件的 PSI / 差异 PSI → 事件谱、PCA、热图、散点图、火山图")
@@ -225,33 +234,54 @@ with tab_input:
     st.subheader("样本与分组")
     st.info("本网页从**表达定量**（salmon `quant.sf` / TPM 矩阵）开始计算 PSI。"
             "FASTQ 比对需要基因组索引，请在本地或服务器上完成，再把 `quant.sf` 传上来。")
+    reference, all_pairs = None, False
     if source_kind == "已有 PSI 结果":
-        st.info("当前使用已有的 PSI 结果文件，请在下方表格里为每个样本选择分组。")
+        st.info("当前使用已有的 PSI 结果文件，请在下方表格里为每个样本填写分组。")
         sample_cols = sorted({c for m in merged for c in m.columns})
         base = pd.DataFrame({"sample": sample_cols,
-                             "condition": ["case" if any(k in s.lower() for k in ("case", "cko", "ko"))
-                                           else "ctrl" for s in sample_cols]})
+                             "condition": [_guess_condition(s) for s in sample_cols]})
     else:
         base = pd.DataFrame({"sample": list(tpm_tables),
-                             "condition": [groups.get(s, "ctrl") for s in tpm_tables]})
+                             "condition": [groups.get(s) or _guess_condition(s) for s in tpm_tables]})
     if base.empty:
         st.warning("还没有数据。请在左侧选择数据来源并上传文件，或直接使用演示数据。")
     else:
-        edited = st.data_editor(base, hide_index=True,
+        st.caption("分组名可以随便填：**相同字符串就是同一组，填几组都行**。"
+                   "时间序列填 11.5 / 12.5 / 13.5，实验组填 Control / cKO / Rescue 都可以。")
+        edited = st.data_editor(base, hide_index=True, key="group_editor",
                                 column_config={
                                     "sample": st.column_config.TextColumn("样本名", disabled=True),
-                                    "condition": st.column_config.SelectboxColumn(
-                                        "分组", options=["ctrl", "case"], required=True),
+                                    "condition": st.column_config.TextColumn("分组（可自由填写）",
+                                                                            required=True),
                                 })
-        groups = dict(zip(edited["sample"], edited["condition"]))
-        n_ctrl = sum(1 for v in groups.values() if v == "ctrl")
-        n_case = sum(1 for v in groups.values() if v == "case")
-        c1, c2, c3 = st.columns(3)
-        c1.metric("样本数", len(groups))
-        c2.metric("ctrl", n_ctrl)
-        c3.metric("case", n_case)
-        if n_ctrl == 0 or n_case == 0:
-            st.warning("两组都需要至少 1 个样本；只有一组时不会做差异分析。")
+        groups = {str(s): str(c).strip() for s, c in zip(edited["sample"], edited["condition"])
+                  if str(c).strip()}
+        conds = core.condition_names(groups)
+        st.dataframe(pd.DataFrame(
+            [{"分组": c, "样本数": len(core.samples_of(groups, c))} for c in conds]),
+            hide_index=True)
+        if len(conds) < 2:
+            st.warning("要至少 2 个分组才能做差异分析；现在只有 "
+                       + (str(len(conds)) + " 组。" if conds else "0 组。"))
+        else:
+            guess = core.pick_reference(groups, conds)
+            col_r, col_p = st.columns([2, 3])
+            with col_r:
+                reference = st.selectbox(
+                    "参考组（dPSI = 比较组 − 参考组）", conds, index=conds.index(guess),
+                    help="默认取名字像对照的组（control / ctrl / wt / mock …）；"
+                         "都不像就取样本数最多的那组。可以手动改。")
+            with col_p:
+                all_pairs = st.checkbox("显示所有两两比较", value=False,
+                                        help=core.COMPARISON_NOTE)
+            plan = core.comparison_plan(groups, reference, all_pairs)
+            st.markdown(f"**将做 {plan.shape[0]} 个比较对**")
+            st.dataframe(plan, hide_index=True)
+            st.caption(core.COMPARISON_NOTE)
+            bad = plan.loc[plan["可算 p 值"] != "是", "比较对"].tolist()
+            if bad:
+                st.warning("这些比较对里有分组的样本数不足 2 个：只会给出 dPSI，"
+                           "p 值 / q 值留空，不计入显著事件 —— " + "、".join(bad))
         if notes:
             st.info("　".join(notes))
 
@@ -275,10 +305,16 @@ if run:
             bar.empty()
     if psi:
         psi = {et: df for et, df in psi.items() if not df.empty and df.shape[0] > 0}
-        dpsi = core.dpsi_tables(psi, groups) if len(set(groups.values())) > 1 else {}
+        comps = core.build_comparisons(groups, reference, all_pairs)
+        dpsi = core.dpsi_tables(psi, groups, comparisons=comps, method=method,
+                                ioe=ioe_tables, tpm=tpm_tables) if comps else {}
         st.session_state["results"] = {"psi": psi, "dpsi": dpsi, "groups": dict(groups),
-                                       "ioe": ioe_tables, "tpm": list(tpm_tables)}
-        st.success(f"完成：{len(psi)} 类事件，{sum(df.shape[0] for df in psi.values()):,} 个事件条目。")
+                                       "ioe": ioe_tables, "tpm": list(tpm_tables),
+                                       "comparisons": comps, "reference": reference,
+                                       "method": method}
+        extra = f"，{len(comps)} 个比较对" if comps else ""
+        st.success(f"完成：{len(psi)} 类事件，"
+                   f"{sum(df.shape[0] for df in psi.values()):,} 个事件条目{extra}。")
     else:
         st.error("没有算出任何 PSI。请检查事件参考集（ioe）是否覆盖了上传的转录本 ID。")
 
@@ -308,9 +344,9 @@ with tab_about:
         st.markdown("**要做完整分析**（表观信号 / 序列特征 / 随机森林）")
         st.code("pip install astk\nastk --help", language="bash")
     st.divider()
-    st.caption("口径提醒：网页端用 Welch t 检验 + BH FDR 做快速筛选，正式发表建议回到命令行 "
-               "`astk dsflow` / `astk diffSplice`（SUPPA2 经验法）。"
-               "FASTQ 比对和 ChIP-seq bigWig 不在本网站范围内。")
+    st.caption("口径提醒：差异分析默认走 ASTK 的 empirical 经验分布法（area=1000、按基因内 "
+               "BH 校正），和命令行 `astk dsflow` 对齐；想对比旧口径可以在左侧参数里切回 "
+               "Welch t 检验。FASTQ 比对和 ChIP-seq bigWig 不在本网站范围内。")
 
 st.sidebar.divider()
 st.sidebar.markdown("**请引用 ASTK**")
@@ -333,8 +369,9 @@ with tab_overview:
     c1.metric("事件类型", len(present))
     c2.metric("事件条目合计", f"{sum(psi[et].shape[0] for et in present):,}")
     c3.metric("样本数", psi[present[0]].shape[1])
-    c4.metric("显著事件（全部类型）",
-              f"{sum(int((d['qval'] <= qval_cut).sum()) for d in dpsi.values()):,}" if dpsi else "-")
+    c4.metric("显著事件（各比较对合计）",
+              f"{int(core.significant_summary(dpsi, abs_dpsi, qval_cut)['n_sig'].sum()):,}"
+              if dpsi else "-")
     left, right = st.columns([1, 1])
     with left:
         _show(plots.fig_event_counts(counts))
@@ -388,28 +425,58 @@ with tab_heat:
 
 with tab_diff:
     if not dpsi:
-        st.info("需要 ctrl / case 两组样本才能做差异分析。")
+        if not res.get("comparisons"):
+            st.info("要至少 2 个分组才能做差异分析。")
+        else:
+            st.info("没有算出 dPSI，请检查分组名是否和 PSI 表的列名对得上。")
     else:
-        st.subheader("显著事件汇总（t 检验 + BH FDR）")
-        sig = core.significant_summary(dpsi, abs_dpsi=abs_dpsi, qval=qval_cut)
-        st.dataframe(sig, hide_index=True)
-        st.caption("网页端用 Welch t 检验 + BH 校正做快速筛选；正式结果建议用命令行 "
-                   "`astk dsflow` / `astk diffSplice`（SUPPA2 经验法）。")
-        et_d = st.selectbox("事件类型", [et for et in AS_ORDER if et in dpsi], key="diff_et",
-                            format_func=lambda x: core.AS_LABELS.get(x, x))
+        used = res.get("method", "empirical")
+        st.subheader("显著事件汇总（ASTK empirical 经验分布法 + 基因内 BH）" if used == "empirical"
+                     else "显著事件汇总（Welch t 检验 + BH FDR）")
+        sig_sum = core.significant_summary(dpsi, abs_dpsi=abs_dpsi, qval=qval_cut)
+        st.dataframe(sig_sum, hide_index=True)
+        st.caption((core.EMPIRICAL_NOTE if used == "empirical" else
+                    "网页端用 Welch t 检验 + BH 校正；这个口径和 `astk dsflow` 不同，"
+                    "显著事件数对不上是正常的。") + " " + core.COMPARISON_NOTE)
+        if used == "empirical":
+            bg = pd.concat([d["background"] for d in dpsi.values()]) if dpsi else pd.Series(dtype=str)
+            if len(bg) and bool((bg == "global").any()):
+                st.info("这批数据没有表达量信息（只上传了 PSI 文件），本地背景退回「全部事件的噪声」，"
+                        "和命令行 `astk dsflow`（用表达量窗口）会有差异；"
+                        "上传 quant.sf 或 TPM 矩阵就能完全对齐。")
+        avail = [et for et in AS_ORDER if et in dpsi] + [et for et in dpsi if et not in AS_ORDER]
+        col_et, col_cmp = st.columns(2)
+        with col_et:
+            et_d = st.selectbox("事件类型", avail, key="diff_et",
+                                format_func=lambda x: core.AS_LABELS.get(x, x))
+        comps_here = list(dict.fromkeys(dpsi[et_d]["comparison"].astype(str)))
+        with col_cmp:
+            if len(comps_here) > 1:
+                comp_d = st.selectbox("比较对", comps_here, key="diff_comp")
+            else:
+                comp_d = comps_here[0]
+                st.text_input("比较对", value=comp_d, disabled=True, key="diff_comp_1")
+        d_d = dpsi[et_d]
+        d_d = d_d[d_d["comparison"].astype(str) == comp_d]
         c1, c2 = st.columns(2)
         with c1:
-            fig = plots.fig_volcano(dpsi[et_d], abs_dpsi=abs_dpsi, qval=qval_cut,
-                                    event_type=core.AS_LABELS.get(et_d, et_d), top_label=int(top_label))
-            if fig is not None:
+            fig = plots.fig_volcano(d_d, abs_dpsi=abs_dpsi, qval=qval_cut, event_type=et_d,
+                                    top_label=int(top_label))
+            if fig is None:
+                st.info("这一比较对没有 p 值（有分组的样本数不足 2），火山图无法绘制；"
+                        "看右边的散点图和下面的表格。")
+            else:
                 _show(fig)
         with c2:
-            fig = plots.fig_scatter(dpsi[et_d], event_type=core.AS_LABELS.get(et_d, et_d),
-                                    abs_dpsi=abs_dpsi, qval=qval_cut)
+            fig = plots.fig_scatter(d_d, event_type=et_d, abs_dpsi=abs_dpsi, qval=qval_cut)
             if fig is not None:
                 _show(fig)
-        stdata = dpsi[et_d].join(ioe_tables[et_d].set_index("event_id")[["seqname", "gene_id"]],
-                                 how="left") if et_d in ioe_tables else dpsi[et_d]
+        if et_d in ioe_tables:
+            meta = ioe_tables[et_d].set_index("event_id")[["seqname", "gene_id"]]
+            meta = meta[~meta.index.duplicated()]
+            stdata = d_d.join(meta, how="left")
+        else:
+            stdata = d_d
         st.dataframe(stdata.sort_values("dpsi", key=lambda s: s.abs(), ascending=False).round(4),
                      height=380)
 
@@ -427,12 +494,21 @@ with tab_dl:
         "fig_pca.png": plots.fig_pca(pd.concat([psi[et] for et in present], axis=0), groups),
         "fig_corr_heatmap.png": plots.fig_corr_heatmap(pd.concat([psi[et] for et in present], axis=0), groups),
     }
-    for et in dpsi:
-        figures[f"volcano_{et}.png"] = plots.fig_volcano(dpsi[et], abs_dpsi, qval_cut, et)
-        figures[f"scatter_{et}.png"] = plots.fig_scatter(dpsi[et], et, abs_dpsi, qval_cut)
+    diff_ets = [et for et in AS_ORDER if et in dpsi] + [et for et in dpsi if et not in AS_ORDER]
+    if diff_ets:
+        default_et = ["AF"] if "AF" in diff_ets else diff_ets[:1]
+        st.markdown("**差异图要打包哪几类事件？** 多分组时「每类事件 x 每个比较对」都要出两张图，"
+                    "全打包会有几十张；只留 AF 最省事。")
+        picked_et = st.multiselect("要打包的事件类型", diff_ets, default=default_et,
+                                   format_func=lambda x: core.AS_LABELS.get(x, x), key="dl_et")
+        for et in picked_et:
+            sub = dpsi[et]
+            for comp in dict.fromkeys(sub["comparison"].astype(str)):
+                part = sub[sub["comparison"].astype(str) == comp]
+                figures[f"volcano_{et}_{comp}.png"] = plots.fig_volcano(part, abs_dpsi, qval_cut, et)
+                figures[f"scatter_{et}_{comp}.png"] = plots.fig_scatter(part, et, abs_dpsi, qval_cut)
     st.download_button("下载全部结果（zip）", _zip_results(payload, figures),
                        file_name="astk_web_results.zip", mime="application/zip", type="primary")
     st.caption(f"包含 {len(payload)} 个表格、"
                f"{sum(1 for f in figures.values() if f is not None)} 张图，以及 CITATION.txt（引用信息）。")
     st.warning("用这些结果发表工作时，请引用 ASTK：" + core.ASTK_CITATION)
-

@@ -88,7 +88,7 @@ conda activate astk_web
 pip install -r requirements.txt
 streamlit run app.py
 
-# 自检（不需要 astk）：合成数据跑通全流程 + 上传路径，26 项检查
+# 自检（不需要 astk）：合成数据跑通全流程 + 上传路径，50+ 项检查
 python selftest.py
 ```
 
@@ -143,10 +143,22 @@ FASTQ
 ## 6. 网页端统计的口径
 
 - **PSI**：`sum(alt TPM) / sum(total TPM)`；当 total 转录本平均 TPM < 阈值 → `NaN`；alt TPM ≤ 0.0001 → 0
-- **dPSI** = `mean(PSI, case) - mean(PSI, ctrl)`
-- **检验**：Welch t 检验 + Benjamini–Hochberg FDR（`qval`），显著 = `qval ≤ 阈值` 且 `|dPSI| ≥ 阈值`
-  - 这是给网页用的**快速筛选**；正式发表口径请回到命令行
-    `astk dsflow` / `astk diffSplice`（SUPPA2 经验法）
+- **dPSI** = `mean(PSI, 比较组) - mean(PSI, 参考组)`
+- **检验（默认）**：ASTK / SUPPA2 `diffSplice` 的 **empirical 经验分布法**，和命令行
+  `astk dsflow` 是同一套逻辑（`core.py` 里的 `empirical_dpsi_table`）
+  - 背景分布 = **同一个条件内部两两重复**的 `|ΔPSI|`（重复之间本不该有真差异）
+  - 背景按表达量坐标排序：事件全部转录本的 TPM 之和取 log10，先在条件内平均重复、
+    再平均两个条件；事件取自己附近 `area = 1000` 个噪声值当「本地背景」
+  - `p = (1 - ECDF(本地背景, |ΔPSI|)) × 0.5`（单尾）；某一侧缺失比例 > `nan_th` 的事件
+    丢弃并记 `p = 1`（SUPPA2 的行为）
+  - 多重检验：BH，**按基因内**校正（对应 astk 的 gene-correction）→ 结果在 `qval` 列，
+    **等于 astk 输出文件里的 p 值列**
+  - 显著 = `qval ≤ 阈值` 且 `|dPSI| ≥ 阈值`
+  - 只上传 PSI 文件（没有表达量坐标）时，背景退回「全部事件的噪声」，界面会写明；
+    上传 `quant.sf` / TPM 矩阵即可和命令行完全对齐
+- **检验（可选）**：左侧参数里能切回 Welch t 检验 + BH FDR 的旧口径，方便和以前的结果对照
+- **火山图的极值**：`p = 0` 的点按 SUPPA2 的 `convert_to_log10pval` 换成「最小非零 p 的一半」；
+  万一还有超过 20 的点再截断到纵轴上限，并在图右下角注明个数
 
 ---
 
